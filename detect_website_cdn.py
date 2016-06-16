@@ -87,7 +87,7 @@ def fetch_hostname(hostname):
     
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter,\
-                                     description='ThousandEyes Challenge')
+                                     description='Search through website hostnames for signs of CDNs')
     parser.add_argument('-o', '--output', type=argparse.FileType('w'), default=sys.stdout, help='output file')
     parser.add_argument('-s', '--sites', type=argparse.FileType('r'), default=sys.stdin, help='one hostname per line')
     parser.add_argument('-c', '--cdns', type=argparse.FileType('r'), default=sys.stdin, help='database of known CDNs to domains, <cdn> <domain> per line')
