@@ -1,116 +1,186 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 
-import os
-import sys
-import argparse
-import signal
-import requests
-import socket
-from multiprocessing import Pool
-from HTMLParser import HTMLParser
-from urlparse import urlparse
+# Class for storing data collected about a domain
+class Domain:
+    def __init__(self, domain):
+        self.domain = domain
 
-# Exception thrown when a timeout occurs
-class TimeoutError(Exception):
-    pass
-# Helper class for throwing timeout exceptions
-class Timeout:
-    def __init__(self, seconds=10, error_message='Timeout'):
-        self.seconds = seconds
-        self.error_message = error_message
-    def handle_timeout(self, signum, frame):
-        raise TimeoutError(self.error_message)
-    def __enter__(self):
-        signal.signal(signal.SIGALRM, self.handle_timeout)
-        signal.alarm(self.seconds)
-    def __exit__(self, type, value, traceback):
-        signal.alarm(0)
-    
-# State data per website
-class Website(object):
-    def __init__(self, hostname):
-        self.root = hostname
-        self.hostnames = set()
-        self.hostnames.add(hostname)
-        self.cdns = set()
+# Gathered from eye-balling the data
+CDN_ASNS = {
+    '13335' : 'Cloudflare',
+    '20940' : 'Akamai',
+    '16509' : 'Amazon',
+    '54113' : 'Fastly',
+    '14153' : 'Edgecast',
+    '19551' : 'Incapsula'
+}
+CDN_DOMAINS = {
+    'cloudfront.net.' : 'Amazon',
+    'amazonaws.com.' : 'Amazon',
+    'edgekey.net.' : 'Akamai',
+    'akamaiedge.net.' : 'Akamai',
+    'akamaitechnologies.com.' : 'Akamai',
+    'akamaihd.net.' : 'Akamai',
+    'cloudflare.com.' : 'Cloudflare',
+    'fastly.net.' : 'Fastly',
+    'edgecastcdn.net.' : 'Edgecast',
+    'impervadns.net.' : 'Incapsula'
+}
 
-    @classmethod
-    def debug_headers(cls):
-        return 'ROOT HOSTNAMES'
-        
-    def debug_output(self):
-        return ' | '.join(map(str, (self.hostname, ','.join(self.hostnames))))
-        
-# Parse HTML looking for hostnames in embedded resources
-class HostnameParser(HTMLParser):
-    def hostname_list(self, hostnames):
-        self.hostnames = hostnames
+def analyze_data(datas):
+    from collections import defaultdict
+    cdn_to_domains = defaultdict(lambda: [])
+    for data in datas:
+        data.cdn = CDN_ASNS[data.remote_asn] if data.remote_asn in CDN_ASNS else None
+        if data.cdn is None: # Couldn't find a CDN by ASN
+            for cname in data.cnames: # Search by CNAME
+                for domain, cdn in CDN_DOMAINS.items():
+                    if cname.endswith(domain):
+                        data.cdn = cdn
+        if data.cdn is not None: # Found a CDN for this domain
+            cdn_to_domains[data.cdn].append(data)
 
-    def handle_starttag(self, tag, attrs):
-        key = None
-        if tag == 'img' or tag == 'script': # Pull sources URLs of images and scripts
-            key = 'src'
-        elif tag == 'link': # Pull HREF for links (i.e., css)
-            key = 'href'
-        
-        if key:
-            for attr,value in attrs: # Search attributes for src/href
-                if attr == key:
-                    hostname = urlparse(value).netloc
-                    if hostname:
-                        self.hostnames.add(hostname)
-                    break            
-        
-def fetch_hostname(hostname):
-    site = Website(hostname)
+    print('1. CDN analysis')
+    print('Rank CDNs by number of sites')
+    for cdn,sites in reversed(sorted(cdn_to_domains.items(), key = lambda x: len(x[1]))):
+        print(cdn, len(sites))
+
+    print()
+    print('Rank CDNs by average TTFB')
+    avgs = {}
+    for cdn,sites in cdn_to_domains.items():
+        import numpy
+        avgs[cdn] = numpy.mean([data.ttfb for data in sites])
+    for cdn,avg in sorted(avgs.items(), key = lambda x: x[1]):
+        print(cdn, avg)
+
+    print()
+    print('Rank CDNs by DNS resolution time')
+    for cdn,sites in cdn_to_domains.items():
+        import numpy
+        avgs[cdn] = numpy.mean([data.dns_resolution for data in sites])
+    for cdn,avg in sorted(avgs.items(), key = lambda x: x[1]):
+        print(cdn, avg)
+
+    print()
+    print('Rank CDNs by TCP handshake time')
+    for cdn,sites in cdn_to_domains.items():
+        import numpy
+        avgs[cdn] = numpy.mean([data.tcp_handshake - data.dns_resolution for data in sites])
+    for cdn,avg in sorted(avgs.items(), key = lambda x: x[1]):
+        print(cdn, avg)
+
+    print()
+    print('Rank CDNs by TLS handshake time')
+    for cdn,sites in cdn_to_domains.items():
+        import numpy
+        avgs[cdn] = numpy.mean([data.tls_handshake - data.tcp_handshake for data in sites])
+    for cdn,avg in sorted(avgs.items(), key = lambda x: x[1]):
+        print(cdn, avg)
+
+    print()
+    print('Rank CDNs by total download time')
+    for cdn,sites in cdn_to_domains.items():
+        import numpy
+        avgs[cdn] = numpy.mean([data.download for data in sites])
+    for cdn,avg in sorted(avgs.items(), key = lambda x: x[1]):
+        print(cdn, avg)
+
+    print()
+    print('2. ASN analysis')
+    print('Rank ASNs by number of sites')
+    asn_to_sites = defaultdict(lambda: [])
+    for data in datas:
+        asn_to_sites[data.remote_asn].append(data)
+    for asn,sites in reversed(sorted(asn_to_sites.items(), key = lambda x: len(x[1]))):
+        print(asn, len(sites))
+
+def process_domain(domain):
     try:
-        with Timeout(seconds=20): # Give up after 20 seconds
-            response = requests.get('http://'+hostname)  
+        hostname = 'www.' + domain # append the default label for the webserver to the hostname
+        domain = Domain(domain) # object to store data
 
-        # Get the hostnames of embedded resources within the page
-        parser = HostnameParser()
-        parser.hostname_list(site.hostnames)
-        parser.feed(response.content.decode(response.encoding))
-        # Get canonical name for each hostname
-        fqdn_hostnames = set()
-        for host in site.hostnames:
-            try:
-                fqdn = socket.getfqdn(host)
-                fqdn_hostnames.add(fqdn)
-            except IOError: # Error in resolution, nothing to be done about it
-                pass
-        # Save all hostnames to the state object
-        site.hostnames = site.hostnames.union(fqdn_hostnames)
+        # use curl to download the index
+        import pycurl
+        curl = pycurl.Curl()
+        curl.setopt(pycurl.URL, 'https://{0}/'.format(hostname))
+        curl.setopt(pycurl.FOLLOWLOCATION, 1)
+        curl.setopt(pycurl.WRITEFUNCTION, lambda x: None)
+        curl.setopt(pycurl.CONNECTTIMEOUT, 30) # 30 second timeout on connect
+        curl.setopt(pycurl.TIMEOUT, 60) # 1 minute timeout on download
+        response = curl.perform()
+        domain.dns_resolution = curl.getinfo(pycurl.NAMELOOKUP_TIME)
+        domain.tcp_handshake = curl.getinfo(pycurl.CONNECT_TIME)
+        domain.tls_handshake = curl.getinfo(pycurl.APPCONNECT_TIME)
+        domain.ttfb = curl.getinfo(pycurl.STARTTRANSFER_TIME)
+        domain.download = curl.getinfo(pycurl.TOTAL_TIME)
+        domain.remote_ip = curl.getinfo(pycurl.PRIMARY_IP)
+        curl.close()
+
+        # Use Team Cymru to lookup the ASN for the remote IP based upon BGP route advertisements
+        from cymruwhois import Client
+        cymru = Client()
+        response = cymru.lookup(domain.remote_ip)
+        domain.remote_asn = response.asn
+        domain.remote_owner = response.owner
+
+        # use dnspython package to obtain all CNAMEs from the hostname.
+        # many CDNs use CNAME records as a means to onboard traffic.
+        domain.cnames = []
+        import dns.resolver
+        answer = dns.resolver.query(hostname, 'A', lifetime = 5.0)
+        for rrset in answer.response.answer:
+            for rr in rrset:
+                if rr.rdtype == 5: # CNAME
+                    domain.cnames.append(str(rr.target))
+
+        return domain
     except Exception as e:
-        sys.stderr.write('Error fetching website '+hostname+': '+str(e)+'\n')
-    return site
-    
+        # Yes, catch alls are bad but this is a quick and dirty script
+        import sys
+        print(e, file = sys.stderr)
+        return None
+
 if __name__ == "__main__":
+    import argparse,sys
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter,\
                                      description='Search through website hostnames for signs of CDNs')
-    parser.add_argument('-o', '--output', type=argparse.FileType('w'), default=sys.stdout, help='output file')
-    parser.add_argument('-s', '--sites', type=argparse.FileType('r'), default=sys.stdin, help='one hostname per line')
-    parser.add_argument('-c', '--cdns', type=argparse.FileType('r'), default=sys.stdin, help='database of known CDNs to domains, <cdn> <domain> per line')
+    parser.add_argument('--alexa_list', default='top-1m.csv')
+    parser.add_argument('--alexa_limit', type=int, default=500)
+    parser.add_argument('--intermediate_file', type=str, default='data.json')
+    parser.add_argument('--skip_fetch', type=str, default=None)
     args = parser.parse_args()
 
-    # Build the dictionary of CDNs from input file
-    cdns = {}
-    for line in args.cdns:
-        cdn,domain = line.strip().split()
-        cdns[domain] = cdn
-    args.cdns.close()
-    
-    pool = Pool(None)
-    index = 0
-    # Pass sites to the child processes to be fetched
-    for site in pool.imap(fetch_hostname, (line.strip() for line in args.sites)):
-        # Compare hostnames in page to known hostnames for CDNs
-        for hostname in site.hostnames:
-            for domain,cdn in cdns.iteritems():
-                if hostname.endswith(domain):
-                    site.cdns.add(cdn)
+    datas = []
+    if args.skip_fetch is None: # Short circuit so that we can repeat the analysis multiple times without re-fetching the data
+        domains = set()
+        import csv
+        with open(args.alexa_list, newline='') as csvfile:
+            for row in csv.reader(csvfile):
+                if len(domains) > args.alexa_limit:
                     break
-        # Output website along with list of CDNs that it uses
-        args.output.write("%s;%s\n" % (site.root, ','.join(site.cdns)))
-        index += 1
-        sys.stderr.write("%d complete\n" % index)        
+                domains.add(row[1]) # Second column is the hostname
+
+        from multiprocessing import Pool
+        pool = Pool(None)
+        complete = 0
+        # Pass domains to the child processes to be fetched
+        for data in pool.imap(process_domain, domains):
+            if data is not None:
+                datas.append(data)
+                complete += 1
+                print(complete, 'complete')
+
+        with open(args.intermediate_file, 'w') as jsonfile:
+            import json
+            json.dump([d.__dict__ for d in datas], jsonfile)
+    else:
+        with open(args.skip_fetch, 'r') as jsonfile:
+            import json
+            for data in json.load(jsonfile):
+                domain = Domain(None)
+                for k,v in data.items():
+                    setattr(domain, k, v)
+                datas.append(domain)
+
+    analyze_data(datas)
